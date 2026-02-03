@@ -9,13 +9,24 @@ interface DashboardProps {
   loading: boolean;
 }
 
+const getCurrencySymbol = (code: string) => {
+    switch (code?.toUpperCase()) {
+        case 'CNY': return '¥';
+        case 'USD': return '$';
+        case 'RUB': return '₽';
+        case 'EUR': return '€';
+        default: return code;
+    }
+};
+
 const CustomTooltip = ({ active, payload, label }: TooltipProps<number, string>) => {
   if (active && payload && payload.length) {
+    const data = payload[0].payload;
     return (
       <div className="bg-white p-3 border border-slate-200 shadow-lg rounded-lg">
         <p className="text-sm font-semibold text-slate-700">{label}</p>
         <p className="text-sm text-blue-600">
-          销售额: ¥ {payload[0].value}
+          销售额: {getCurrencySymbol(data.currency)} {payload[0].value?.toLocaleString()}
         </p>
       </div>
     );
@@ -53,27 +64,45 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
   // Memoized calculations for stats
   const stats = useMemo(() => {
     const totalOrders = orders.length;
-    // Calculate revenue (Direct value as RMB)
-    const totalRevenue = orders.reduce((acc, order) => {
-      const orderTotal = order.financial_data?.products.reduce((sum, p) => sum + p.price, 0) || 
-                         order.products.reduce((sum, p) => sum + parseFloat(p.price), 0);
-      return acc + orderTotal;
-    }, 0);
     
-    // Group sales by date
-    const salesByDate = orders.reduce((acc, order) => {
-      const date = order.in_process_at.split('T')[0]; // YYYY-MM-DD
+    // Group revenue by currency
+    const revenueByCurrency: Record<string, { amount: number, count: number }> = {};
+    const salesByDateAndCurrency: Record<string, Record<string, number>> = {}; // date -> currency -> amount
+
+    orders.forEach(order => {
+      const currency = order.products[0]?.currency_code || 'RUB'; 
       const orderTotal = order.financial_data?.products.reduce((sum, p) => sum + p.price, 0) || 
                          order.products.reduce((sum, p) => sum + parseFloat(p.price), 0);
       
-      if (!acc[date]) {
-        acc[date] = 0;
+      // Total Revenue Stats
+      if (!revenueByCurrency[currency]) {
+          revenueByCurrency[currency] = { amount: 0, count: 0 };
       }
-      acc[date] += orderTotal;
-      return acc;
-    }, {} as Record<string, number>);
+      revenueByCurrency[currency].amount += orderTotal;
+      revenueByCurrency[currency].count += 1;
 
-    // Generate last 15 days explicitly to ensure continuity in chart
+      // Chart Data Aggregation
+      const date = order.in_process_at.split('T')[0]; // YYYY-MM-DD
+      if (!salesByDateAndCurrency[date]) {
+          salesByDateAndCurrency[date] = {};
+      }
+      if (!salesByDateAndCurrency[date][currency]) {
+          salesByDateAndCurrency[date][currency] = 0;
+      }
+      salesByDateAndCurrency[date][currency] += orderTotal;
+    });
+
+    // Find dominant currency for the chart (the one with highest total revenue)
+    let dominantCurrency = 'RUB';
+    let maxRevenue = -1;
+    Object.entries(revenueByCurrency).forEach(([curr, data]) => {
+        if (data.amount > maxRevenue) {
+            maxRevenue = data.amount;
+            dominantCurrency = curr;
+        }
+    });
+
+    // Generate chart data
     const chartData = [];
     for (let i = 14; i >= 0; i--) {
         const d = new Date();
@@ -81,18 +110,21 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
         const dateStr = d.toISOString().split('T')[0];
         const monthDay = dateStr.substring(5); // MM-DD
         
+        const amount = salesByDateAndCurrency[dateStr]?.[dominantCurrency] || 0;
+        
         chartData.push({
             date: monthDay,
-            amount: salesByDate[dateStr] || 0
+            amount: amount,
+            currency: dominantCurrency
         });
     }
 
-    return { totalOrders, totalRevenue, chartData };
+    return { totalOrders, revenueByCurrency, chartData, dominantCurrency };
   }, [orders]);
 
   // Smart Grouping Logic: Filter single items and group by Offer ID
   const smartGroups = useMemo(() => {
-      const groups: Record<string, { product: any, orders: OzonPosting[] }> = {};
+      const groups: Record<string, { product: any, orders: OzonPosting[], currency: string }> = {};
       
       orders.forEach(order => {
           // Only consider orders with exactly 1 product line item
@@ -102,7 +134,7 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
               const key = product.offer_id;
               
               if (!groups[key]) {
-                  groups[key] = { product, orders: [] };
+                  groups[key] = { product, orders: [], currency: product.currency_code || 'RUB' };
               }
               groups[key].orders.push(order);
           }
@@ -197,8 +229,8 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
 
     // BOM for Excel utf-8 compatibility
     let csvContent = '\uFEFF';
-    // Headers
-    csvContent += '货号 (Offer ID),SKU,商品名称,总数量 (件),待打包订单,已打包订单\n';
+    // Headers with Currency
+    csvContent += '货号 (Offer ID),SKU,商品名称,单价,币种,总数量 (件),待打包订单,已打包订单\n';
 
     smartGroups.forEach(group => {
         // Calculate total quantity (sum of quantity field of the single product in each order)
@@ -211,8 +243,7 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
         const safeName = group.product.name.replace(/"/g, '""');
         
         // Use template literal for CSV row
-        // Note: SKU is number in types, converting to string
-        csvContent += `${group.product.offer_id},${group.product.sku},"${safeName}",${totalQty},${unpackedCount},${packedCount}\n`;
+        csvContent += `${group.product.offer_id},${group.product.sku},"${safeName}",${group.product.price},${group.currency},${totalQty},${unpackedCount},${packedCount}\n`;
     });
 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -234,6 +265,8 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
     );
   }
 
+  const currencyKeys = Object.keys(stats.revenueByCurrency);
+
   return (
     <div className="space-y-6">
       
@@ -241,11 +274,24 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-6 text-white shadow-lg shadow-blue-200">
           <div className="flex justify-between items-start">
-            <div>
-              <p className="text-blue-100 text-sm font-medium mb-1">总销售额 (所有店铺)</p>
-              <h3 className="text-3xl font-bold">¥ {stats.totalRevenue.toLocaleString()}</h3>
+            <div className="flex-1">
+              <p className="text-blue-100 text-sm font-medium mb-2">总销售额 (按币种)</p>
+              {currencyKeys.length > 0 ? (
+                  <div className="space-y-1">
+                      {currencyKeys.map(curr => (
+                          <div key={curr} className="flex items-baseline gap-2">
+                              <h3 className="text-2xl font-bold">
+                                  {getCurrencySymbol(curr)} {stats.revenueByCurrency[curr].amount.toLocaleString()}
+                              </h3>
+                              <span className="text-xs bg-white/20 px-1.5 py-0.5 rounded text-white/90">{curr}</span>
+                          </div>
+                      ))}
+                  </div>
+              ) : (
+                  <h3 className="text-3xl font-bold">¥ 0</h3>
+              )}
             </div>
-            <div className="bg-white/20 p-2 rounded-lg">
+            <div className="bg-white/20 p-2 rounded-lg ml-4">
               <DollarSign size={24} className="text-white" />
             </div>
           </div>
@@ -265,13 +311,28 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
 
         <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
            <div className="flex justify-between items-start">
-            <div>
-              <p className="text-slate-500 text-sm font-medium mb-1">平均客单价</p>
-              <h3 className="text-3xl font-bold text-slate-800">
-                ¥ {stats.totalOrders > 0 ? Math.round(stats.totalRevenue / stats.totalOrders).toLocaleString() : 0}
-              </h3>
+            <div className="flex-1">
+              <p className="text-slate-500 text-sm font-medium mb-2">平均客单价</p>
+              {currencyKeys.length > 0 ? (
+                  <div className="space-y-1">
+                      {currencyKeys.map(curr => {
+                          const { amount, count } = stats.revenueByCurrency[curr];
+                          const avg = count > 0 ? Math.round(amount / count) : 0;
+                          return (
+                            <div key={curr} className="flex items-baseline gap-2">
+                                <h3 className="text-xl font-bold text-slate-800">
+                                    {getCurrencySymbol(curr)} {avg.toLocaleString()}
+                                </h3>
+                                <span className="text-xs text-slate-400">{curr}</span>
+                            </div>
+                          );
+                      })}
+                  </div>
+              ) : (
+                  <h3 className="text-3xl font-bold text-slate-800">0</h3>
+              )}
             </div>
-            <div className="bg-emerald-100 p-2 rounded-lg text-emerald-600">
+            <div className="bg-emerald-100 p-2 rounded-lg text-emerald-600 ml-4">
               <TrendingUp size={24} />
             </div>
           </div>
@@ -283,7 +344,12 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
         
         {/* Chart Section (Full width) */}
         <div className="lg:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-          <h3 className="text-lg font-bold text-slate-800 mb-6">近15日销售趋势 (¥)</h3>
+          <div className="flex justify-between items-center mb-6">
+            <h3 className="text-lg font-bold text-slate-800">近15日销售趋势</h3>
+            <span className="text-xs bg-slate-100 text-slate-500 px-2 py-1 rounded">
+                显示主营币种: {stats.dominantCurrency}
+            </span>
+          </div>
           <div className="h-[300px] w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={stats.chartData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
@@ -375,7 +441,7 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
                     <th className="px-6 py-3">店铺 ID</th>
                     <th className="px-6 py-3">订单号</th>
                     <th className="px-6 py-3 w-80">商品信息</th>
-                    <th className="px-6 py-3">金额 (¥)</th>
+                    <th className="px-6 py-3">金额</th>
                     <th className="px-6 py-3">Ozon 状态</th>
                     <th className="px-6 py-3">操作</th>
                 </tr>
@@ -386,6 +452,7 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
                     const isSelected = selectedOrders.has(order.posting_number);
                     const isPacked = packedOrderIds.has(order.posting_number);
                     const mainProduct = order.products[0];
+                    const currency = mainProduct?.currency_code || '';
 
                     return (
                     <tr key={order.posting_number} className={`hover:bg-slate-50 transition-colors ${isSelected ? 'bg-blue-50/50' : ''}`}>
@@ -427,7 +494,7 @@ const Dashboard: React.FC<DashboardProps> = ({ orders, loading }) => {
                         </div>
                     </td>
                     <td className="px-6 py-4 font-medium text-slate-800">
-                        ¥ {price.toLocaleString()}
+                        {getCurrencySymbol(currency)} {price.toLocaleString()} <span className="text-xs text-slate-400 font-normal">{currency}</span>
                     </td>
                     <td className="px-6 py-4">
                         <span className={`px-2.5 py-1 rounded-full text-xs font-medium border
